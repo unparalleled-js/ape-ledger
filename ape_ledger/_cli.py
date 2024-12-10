@@ -1,21 +1,24 @@
-from typing import List
+from typing import TYPE_CHECKING, Union
 
 import click
-from ape import accounts
-from ape.cli import (
-    ape_cli_context,
-    existing_alias_argument,
-    non_existing_alias_argument,
-    skip_confirmation_option,
-)
-from eth_account import Account
-from eth_account.messages import encode_defunct
+from ape.cli.arguments import existing_alias_argument, non_existing_alias_argument
+from ape.cli.options import ape_cli_context, network_option, skip_confirmation_option
 
-from ape_ledger.accounts import LedgerAccount
-from ape_ledger.choices import AddressPromptChoice
-from ape_ledger.client import connect_to_ethereum_app
+if TYPE_CHECKING:
+    # NOTE: Type-checking only imports so CLI help loads faster.
+    from ape.api import AccountAPI
+    from ape_ledger.accounts import LedgerAccount
+    from ape_ledger.hdpath import HDAccountPath, HDBasePath
+
 from ape_ledger.exceptions import LedgerSigningError
-from ape_ledger.hdpath import HDBasePath
+
+
+def _select_account(hd_path: Union["HDBasePath", str]) -> tuple[str, "HDAccountPath"]:
+    # NOTE: Lazy import so CLI help loads faster.
+    from ape_ledger.choices import AddressPromptChoice
+
+    choices = AddressPromptChoice(hd_path)
+    return choices.get_user_selected_account()
 
 
 @click.group(short_help="Manage Ledger accounts")
@@ -36,7 +39,7 @@ def _list(cli_ctx):
         cli_ctx.logger.warning("No accounts found.")
         return
 
-    num_accounts = len(accounts)
+    num_accounts = len(ledger_accounts)
     header = f"Found {num_accounts} account"
     header += "s:" if num_accounts > 1 else ":"
     click.echo(header)
@@ -47,8 +50,18 @@ def _list(cli_ctx):
         click.echo(f"  {account.address}{alias_display}{hd_path_display}")
 
 
-def _get_ledger_accounts() -> List[LedgerAccount]:
-    return [a for a in accounts if isinstance(a, LedgerAccount)]
+def _get_ledger_accounts() -> list["LedgerAccount"]:
+    from ape.utils.basemodel import ManagerAccessMixin
+
+    from ape_ledger.accounts import LedgerAccount
+
+    return [a for a in ManagerAccessMixin.account_manager if isinstance(a, LedgerAccount)]
+
+
+def _hdpath_callback(ctx, param, val) -> "HDBasePath":
+    from ape_ledger.hdpath import HDBasePath
+
+    return HDBasePath(val)
 
 
 @cli.command()
@@ -61,26 +74,30 @@ def _get_ledger_accounts() -> List[LedgerAccount]:
         "Defaults to m/44'/60'/{x}'/0/0 where {{x}} is the account ID. "
         "Exclude {x} to append the account ID to the end of the base path."
     ),
-    callback=lambda ctx, param, arg: HDBasePath(arg),
+    callback=_hdpath_callback,
 )
 def add(cli_ctx, alias, hd_path):
     """Add an account from your Ledger hardware wallet"""
 
-    app = connect_to_ethereum_app(hd_path)
-    choices = AddressPromptChoice(app)
-    address, account_hd_path = choices.get_user_selected_account()
-    container = accounts.containers.get("ledger")
+    address, account_hd_path = _select_account(hd_path)
+    container = cli_ctx.account_manager.containers["ledger"]
     container.save_account(alias, address, str(account_hd_path))
     cli_ctx.logger.success(f"Account '{address}' successfully added with alias '{alias}'.")
 
 
+def _filter_accounts(acct: "AccountAPI") -> bool:
+    from ape_ledger.accounts import LedgerAccount
+
+    return isinstance(acct, LedgerAccount)
+
+
 @cli.command()
 @ape_cli_context()
-@existing_alias_argument(account_type=LedgerAccount)
+@existing_alias_argument(account_type=_filter_accounts)
 def delete(cli_ctx, alias):
     """Remove a Ledger account from ape"""
 
-    container = accounts.containers.get("ledger")
+    container = cli_ctx.account_manager.containers["ledger"]
     container.delete_account(alias)
     cli_ctx.logger.success(f"Account '{alias}' has been removed.")
 
@@ -91,7 +108,7 @@ def delete(cli_ctx, alias):
 def delete_all(cli_ctx, skip_confirmation):
     """Remove all Ledger accounts from ape"""
 
-    container = accounts.containers.get("ledger")
+    container = cli_ctx.account_manager.containers["ledger"]
     ledger_accounts = _get_ledger_accounts()
     if len(ledger_accounts) == 0:
         cli_ctx.logger.warning("No accounts found.")
@@ -111,14 +128,31 @@ def delete_all(cli_ctx, skip_confirmation):
 @ape_cli_context()
 @click.argument("alias")
 @click.argument("message", default="Hello World!")
-def sign_message(cli_ctx, alias, message):
+@network_option()
+def sign_message(cli_ctx, alias, message, network):
     """Sign a message using a Ledger account"""
 
-    if alias not in accounts.aliases:
+    ctx = None
+    if network:
+        ctx = cli_ctx.network_manager.parse_network_choice(network)
+        ctx.__enter__()
+
+    try:
+        _sign_message(cli_ctx, alias, message)
+    finally:
+        if network and ctx and ctx._provider and ctx._provider.is_connected:
+            ctx.__exit__()
+
+
+def _sign_message(cli_ctx, alias, message):
+    from eth_account.account import Account
+    from eth_account.messages import encode_defunct
+
+    if alias not in cli_ctx.account_manager.aliases:
         cli_ctx.abort(f"Account with alias '{alias}' does not exist.")
 
     eip191message = encode_defunct(text=message)
-    account = accounts.load(alias)
+    account = cli_ctx.account_manager.load(alias)
     signature = account.sign_message(eip191message)
 
     if not signature:
@@ -136,9 +170,13 @@ def sign_message(cli_ctx, alias, message):
 
 
 @cli.command(short_help="Verify a message with your Trezor device")
+@ape_cli_context()
 @click.argument("message")
 @click.argument("signature")
-def verify_message(message, signature):
+def verify_message(cli_ctx, message, signature):
+    from eth_account.account import Account
+    from eth_account.messages import encode_defunct
+
     eip191message = encode_defunct(text=message)
 
     try:
@@ -147,5 +185,9 @@ def verify_message(message, signature):
         message = "Message cannot be verified. Check the signature and try again."
         raise LedgerSigningError(message) from exc
 
-    alias = accounts[signer_address].alias if signer_address in accounts else ""
+    alias = (
+        cli_ctx.account_manager[signer_address].alias
+        if signer_address in cli_ctx.account_manager
+        else ""
+    )
     click.echo(f"Signer: {signer_address}  {alias}")
